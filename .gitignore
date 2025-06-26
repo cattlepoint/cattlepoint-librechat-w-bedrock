@@ -1,0 +1,10 @@
+*
+!.gitignore
+!LICENSE
+!README.md
+!pyproject.toml
+!requirements-linters.txt
+!.cfn-lintrc
+!.yamllintrc
+!cattlepoint-librechat-w-bedrock.yaml
+!cattlepoint-librechat-w-bedrock-pipeline.yaml

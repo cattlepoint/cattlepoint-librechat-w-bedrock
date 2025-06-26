@@ -1,0 +1,26 @@
+extends: default
+
+# Paths to ignore
+ignore: |
+  .git
+  .venv
+  build
+  dist
+  __pycache__
+
+rules:
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+
+  line-length:
+    max: 100
+    level: warning
+
+  trailing-spaces:
+    level: warning
+
+  document-start: disable
+
+  truthy:
+    level: warning

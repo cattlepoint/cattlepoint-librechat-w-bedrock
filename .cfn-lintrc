@@ -1,0 +1,30 @@
+templates:
+  - "**/*.yml"
+  - "**/*.yaml"
+  - "**/*.json"
+
+ignore_templates:
+  - "**/build/**"
+  - "**/dist/**"
+  - "**/.venv/**"
+  - "**/__pycache__/**"
+  - "**/tests/**"
+
+regions:
+  - us-east-1
+  - us-east-2
+  - us-west-1
+  - us-west-2
+
+include_checks:
+  - E
+  - W
+  - I
+
+ignore_checks:
+  - W2001
+  - I3012
+
+configure_rules:
+  E3002:
+    strict: true

@@ -1,0 +1,11 @@
+yamllint
+cfn-lint
+pyflakes
+flake8
+flake8-bugbear
+flake8-bandit
+bandit
+black
+isort
+mypy
+ruff

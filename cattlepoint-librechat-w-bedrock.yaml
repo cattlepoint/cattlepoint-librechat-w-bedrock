@@ -1,0 +1,808 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Deploys LibreChat on a cost-effective t4g.small (Graviton) Spot EC2 instance with native Amazon Bedrock
+  integration. The stack provisions:
+    • Auto Scaling Group behind an Application Load Balancer
+    • CloudFront distribution with TLS 1.2
+    • S3 bucket for configuration and persistent data
+    • Optional DynamoDB table for chat history
+    • Least-privilege IAM roles
+    • Dual-AZ VPC with public subnets; security groups accept traffic only from CloudFront and EC2 Instance Connect.
+
+Mappings:
+  CloudFrontPrefixMap:
+    us-east-1:
+      PrefixList: pl-3b927c52
+    us-east-2:
+      PrefixList: pl-b6a144df
+    us-west-1:
+      PrefixList: pl-4ea04527
+    us-west-2:
+      PrefixList: pl-82a045eb
+    eu-central-1:
+      PrefixList: pl-a3a144ca
+    eu-west-1:
+      PrefixList: pl-4fa04526
+    eu-west-2:
+      PrefixList: pl-93a247fa
+    eu-west-3:
+      PrefixList: pl-75b1541c
+    ap-southeast-1:
+      PrefixList: pl-31a34658
+    ap-southeast-2:
+      PrefixList: pl-b8a742d1
+    ap-northeast-1:
+      PrefixList: pl-58a04531
+    ap-northeast-2:
+      PrefixList: pl-22a6434b
+    ap-south-1:
+      PrefixList: pl-9aa247f3
+    sa-east-1:
+      PrefixList: pl-5da64334
+
+Resources:
+  LibreChatInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+      Policies:
+        - PolicyName: LibreChatInstanceDataAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "arn:aws:s3:::${LibreChatBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${LibreChatBucket}"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${LibreChatTable}"
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  LibreChatInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref LibreChatInstanceRole
+
+  HelperFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: HelperFunctionDataAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !Sub "arn:aws:s3:::${LibreChatBucket}"
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource: !Sub "arn:aws:s3:::${LibreChatBucket}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:DescribeTable
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${LibreChatTable}"
+              - Effect: Allow
+                Action:
+                  - s3:DeleteBucket
+                Resource: !Sub "arn:aws:s3:::${LibreChatBucket}"
+
+              - Effect: Allow
+                Action:
+                  - dynamodb:DeleteTable
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${LibreChatTable}"
+
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeManagedPrefixLists
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  HelperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt HelperFunctionRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import urllib.request
+          import logging
+          from contextlib import closing
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+
+
+          def send_response(event, context, status, data=None, reason=None):
+              """
+              Replacement for the removed `cfnresponse` helper, as per
+              https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/crpg-ref-responses.html
+              """
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or "See CloudWatch logs",
+                  "PhysicalResourceId": event.get("PhysicalResourceId",
+                                                  context.log_stream_name),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False,
+                  "Data": data or {}
+              }).encode()
+
+              req = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=body,
+                  method="PUT",
+                  headers={
+                      "Content-Type": "",
+                      "Content-Length": str(len(body))
+                  }
+              )
+
+              with closing(urllib.request.urlopen(req)):
+                  pass
+
+
+          def handler(event, context):
+              logger.info("Event: %s", json.dumps(event))
+              action = event.get('ResourceProperties', {}).get('Action')
+              bucket = event.get('ResourceProperties', {}).get('BucketName')
+              table = event.get('ResourceProperties', {}).get('TableName')
+
+              try:
+                  if event["RequestType"] == "Delete" and action == "Cleanup":
+                      if bucket:
+                          s3 = boto3.client('s3')
+                          paginator = s3.get_paginator('list_object_versions')
+                          for page in paginator.paginate(Bucket=bucket):
+                              objs = ([{"Key": v["Key"], "VersionId": v["VersionId"]}
+                                       for v in page.get("Versions", [])] +
+                                      [{"Key": m["Key"], "VersionId": m["VersionId"]}
+                                       for m in page.get("DeleteMarkers", [])])
+                              if objs:
+                                  try:
+                                      s3.delete_objects(
+                                          Bucket=bucket,
+                                          Delete={"Objects": objs}
+                                      )
+                                  except ClientError as e:
+                                      logger.error("S3 delete_objects failed: %s", e, exc_info=True)
+                                      raise
+
+                      if table:
+                          ddb = boto3.client('dynamodb')
+                          paginator = ddb.get_paginator('scan')
+                          for page in paginator.paginate(
+                                  TableName=table,
+                                  ProjectionExpression='#k',
+                                  ExpressionAttributeNames={'#k': 'PK'}):
+                              items = page.get("Items", [])
+                              while items:
+                                  chunk, items = items[:25], items[25:]
+                                  try:
+                                      ddb.batch_write_item(
+                                          RequestItems={
+                                              table: [{
+                                                  "DeleteRequest": {
+                                                      "Key": {"PK": {"S": it['PK']['S']}}
+                                                  }
+                                              } for it in chunk]
+                                          }
+                                      )
+                                  except ClientError as e:
+                                      logger.error("DynamoDB batch_write_item failed: %s", e, exc_info=True)
+                                      raise
+
+                      send_response(event, context, "SUCCESS", {})
+                      return
+
+                  elif action == "DescribeNetwork":
+                      ec2 = boto3.client('ec2')
+
+                      # default VPC
+                      try:
+                          vpcs = ec2.describe_vpcs(
+                              Filters=[{'Name': 'isDefault', 'Values': ['true']}]
+                          )['Vpcs']
+                      except ClientError as e:
+                          logger.error("describe_vpcs failed: %s", e, exc_info=True)
+                          send_response(event, context, "FAILED", {}, reason=str(e))
+                          return
+
+                      if not vpcs:
+                          send_response(event, context, "FAILED", {},
+                                        reason="No default VPC found in this account/region")
+                          return
+
+                      default_vpc_id = vpcs[0]['VpcId']
+
+                      try:
+                          subnets = ec2.describe_subnets(
+                              Filters=[{'Name': 'vpc-id', 'Values': [default_vpc_id]}]
+                          )['Subnets']
+                      except ClientError as e:
+                          logger.error("describe_subnets failed: %s", e, exc_info=True)
+                          send_response(event, context, "FAILED", {}, reason=str(e))
+                          return
+
+                      subnet_ids = ",".join([s['SubnetId'] for s in subnets])
+
+                      try:
+                          plists = ec2.describe_managed_prefix_lists(
+                              Filters=[{'Name': 'prefix-list-name',
+                                        'Values': ['com.amazonaws.global.cloudfront.origin-facing']}]
+                          )['PrefixLists']
+                      except ClientError as e:
+                          logger.error("describe_managed_prefix_lists failed: %s", e, exc_info=True)
+                          send_response(event, context, "FAILED", {}, reason=str(e))
+                          return
+
+                      cf_pl_id = plists[0]['PrefixListId'] if plists else ""
+
+                      response_data = {
+                          'DefaultVpcId': default_vpc_id,
+                          'SubnetIds': subnet_ids,
+                          'CloudFrontPrefixListId': cf_pl_id,
+                      }
+                      send_response(event, context, "SUCCESS", response_data)
+                      return
+
+                  else:
+                      send_response(event, context, "SUCCESS", {})
+                      return
+
+              except Exception as exc:
+                  logger.error("Unhandled exception", exc_info=True)
+                  send_response(event, context, "FAILED", {}, reason=str(exc))
+                  return
+
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  LibreChatVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  LibreChatIgw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  LibreChatIgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LibreChatVpc
+      InternetGatewayId: !Ref LibreChatIgw
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LibreChatVpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-a"
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LibreChatVpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-b"
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LibreChatVpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-rt"
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  DefaultRouteToIgw:
+    Type: AWS::EC2::Route
+    DependsOn: LibreChatIgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref LibreChatIgw
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  LibreChatBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Join
+        - "-"
+        - - "librechat"
+          - !Select
+            - 4
+            - !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  LibreChatTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Join
+        - "-"
+        - - "librechat"
+          - !Select
+            - 4
+            - !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  InstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: LibreChat EC2 instance security group
+      VpcId: !Ref LibreChatVpc
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  ALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: LibreChat Load Balancer security group
+      VpcId: !Ref LibreChatVpc
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  ALBSGIngressFromCloudFront:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ALBSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourcePrefixListId:
+        !FindInMap [CloudFrontPrefixMap, !Ref "AWS::Region", PrefixList]
+      Description: Allow HTTP from CloudFront edge
+
+  InstanceSGIngressFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref ALBSG
+      GroupId: !Ref InstanceSG
+      Description: Allow HTTP traffic from ALB to instance
+
+  InstanceSGIngressSSH:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: 129.222.0.0/16
+      GroupId: !Ref InstanceSG
+      Description: Allow SSH access for EC2 Instance Connect from Starlink IP range
+
+  LibreChatALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-LibreChatALB"
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups: [!Ref ALBSG]
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  LibreChatTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-LibreChatTG"
+      VpcId: !Ref LibreChatVpc
+      TargetType: instance
+      Protocol: HTTP
+      Port: 80
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  LibreChatListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LibreChatALB
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref LibreChatTargetGroup
+
+  LibreChatLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-LibreChatLT"
+      LaunchTemplateData:
+        InstanceType: t4g.small
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            InstanceInterruptionBehavior: terminate
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 10
+              VolumeType: gp3
+              DeleteOnTermination: true
+        IamInstanceProfile:
+          Arn: !GetAtt LibreChatInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref InstanceSG
+        ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}"
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash -xe
+              yum update -y
+              yum install docker git -y
+              systemctl enable --now docker
+              usermod -aG docker ec2-user
+              curl -L https://github.com/docker/compose/releases/download/v2.26.1/docker-compose-`uname -s`-`uname -m` -o /usr/local/bin/docker-compose
+              chmod +x /usr/local/bin/docker-compose
+              cd /home/ec2-user
+              curl -L https://github.com/danny-avila/LibreChat/archive/799f0e5810208ee29f9b8b4972f7234121f4d7da.tar.gz | tar -xz
+              cd LibreChat-799f0e5810208ee29f9b8b4972f7234121f4d7da
+              cp .env.example .env
+              cp librechat.example.yaml librechat.yaml
+              aws s3 cp s3://${Bucket}/.env .env
+              aws s3 cp s3://${Bucket}/librechat.yaml librechat.yaml
+              chown -R ec2-user:ec2-user .
+              docker-compose -f ./deploy-compose.yml up -d
+            - Bucket: !Ref LibreChatBucket
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Project
+              Value: !Ref AWS::StackName
+
+  LibreChatASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: LibreChatConfigFile
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LibreChatLaunchTemplate
+        Version: !GetAtt LibreChatLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+      TargetGroupARNs: [!Ref LibreChatTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+          PropagateAtLaunch: true
+
+  CleanupTrigger:
+    Type: Custom::CleanupTrigger
+    Properties:
+      ServiceToken: !GetAtt HelperFunction.Arn
+      Action: "Cleanup"
+      BucketName: !Ref LibreChatBucket
+      TableName: !Ref LibreChatTable
+
+  LibreChatCloudFront:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Origins:
+          - Id: LibreChatOrigin
+            DomainName: !GetAtt LibreChatALB.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: LibreChatOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+          CachedMethods: ["GET", "HEAD"]
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  LibreChatConfigWriterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3PutDeleteLibreChatConfig
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:PutObjectTagging
+                Resource:
+                  - !Sub "arn:aws:s3:::${LibreChatBucket}"
+                  - !Sub "arn:aws:s3:::${LibreChatBucket}/*"
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  LibreChatConfigWriter:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LibreChatConfigWriterRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import boto3, json, urllib.request, logging, secrets, os
+          from contextlib import closing
+          from botocore.exceptions import ClientError
+
+          CONFIG = """# For more information, see the Configuration Guide:
+          # https://docs.librechat.ai/install/configuration/custom_config.html
+
+          version: 1.2.8
+          cache: true
+          """
+
+          ENV_TMPL = """# For more information, see the Environment Variables Guide:
+          # https://docs.librechat.ai/install/configuration/environment_variables.html
+
+          BEDROCK_AWS_DEFAULT_REGION={region}
+          # BEDROCK_AWS_MODELS=anthropic.claude-3-5-sonnet-20240620-v1:0,meta.llama3-1-8b-instruct-v1:0
+          CREDS_KEY={creds_key}
+          CREDS_IV={creds_iv}
+          ALLOW_REGISTRATION=true
+          HOST=localhost
+          PORT=3080
+          JWT_SECRET={jwt_secret}
+          JWT_REFRESH_SECRET={jwt_refresh_secret}
+          OPENAI_API_KEY=user_provided
+          """
+
+          logging.basicConfig(
+              level=logging.DEBUG,
+              format="%(levelname)s\t%(asctime)s\t%(name)s\t%(message)s",
+              datefmt="%Y-%m-%dT%H:%M:%S%z",
+              force=True,
+          )
+          log = logging.getLogger(__name__)
+
+          def respond(event, context, status, reason="OK"):
+              """Send CloudFormation response back to the pre‑signed S3 URL"""
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason,
+                  "PhysicalResourceId": event.get("PhysicalResourceId", context.log_stream_name),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False,
+                  "Data": {},
+              }).encode()
+              req = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=body,
+                  method="PUT",
+                  headers={"Content-Type": "", "Content-Length": str(len(body))},
+              )
+              with closing(urllib.request.urlopen(req)):
+                  pass
+
+          def _verify_exists(s3, bucket, key):
+              """Confirm the object now exists in S3"""
+              try:
+                  s3.head_object(Bucket=bucket, Key=key)
+                  log.debug("Verified s3://%s/%s is present", bucket, key)
+              except ClientError as err:
+                  log.error("Object s3://%s/%s missing: %s", bucket, key, err)
+
+          def handler(event, context):
+              log.info("Incoming event: %s", json.dumps(event))
+              try:
+                  props  = event.get("ResourceProperties", {})
+                  bucket = props["BucketName"]
+                  region = props.get("Region", os.environ["AWS_REGION"])
+                  s3 = boto3.client("s3", region_name=region)
+                  configfile = "librechat.yaml"
+                  envfile = ".env"
+              except Exception as exc:
+                  log.error("Error parsing event properties: %s", exc)
+                  respond(event, context, "FAILED", str(exc))
+                  return
+              else:
+                  log.debug("Parsed properties: %s", props)
+
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      # Upload config file
+                      log.debug("Uploading %s to bucket %s", configfile, bucket)
+                      resp_cfg = s3.put_object(
+                          Bucket=bucket,
+                          Key=configfile,
+                          Body=CONFIG.encode(),
+                          ContentType="application/yaml",
+                      )
+                      log.debug("PutObject response for %s: %s", configfile, resp_cfg)
+                      _verify_exists(s3, bucket, configfile)
+
+                      # Build environment file
+                      env_body = ENV_TMPL.format(
+                          region=region,
+                          creds_key=secrets.token_hex(32),
+                          creds_iv=secrets.token_hex(16),
+                          jwt_secret=secrets.token_hex(32),
+                          jwt_refresh_secret=secrets.token_hex(32),
+                      )
+
+                      # Upload env file
+                      log.debug("Uploading %s to bucket %s", envfile, bucket)
+                      resp_env = s3.put_object(
+                          Bucket=bucket,
+                          Key=envfile,
+                          Body=env_body.encode(),
+                          ContentType="text/plain",
+                      )
+                      log.debug("PutObject response for %s: %s", envfile, resp_env)
+                      _verify_exists(s3, bucket, envfile)
+
+                  elif event["RequestType"] == "Delete":
+                      for key in (configfile, envfile):
+                          log.debug("Deleting %s from bucket %s", key, bucket)
+                          s3.delete_object(Bucket=bucket, Key=key)
+                          log.info("%s deleted from %s", key, bucket)
+
+                  respond(event, context, "SUCCESS")
+              except Exception as exc:
+                  log.exception("Operation failed")
+                  respond(event, context, "FAILED", str(exc))
+
+  LibreChatConfigFile:
+    Type: Custom::LibreChatConfigFile
+    Properties:
+      ServiceToken: !GetAtt LibreChatConfigWriter.Arn
+      BucketName: !Ref LibreChatBucket
+      Region: !Ref AWS::Region
+
+Outputs:
+  ChatWebsiteURL:
+    Description: URL of the LibreChat application (CloudFront Distribution)
+    Value: !Join ["", ["https://", !GetAtt LibreChatCloudFront.DomainName]]
+  ConfigS3BucketName:
+    Description: S3 bucket name for LibreChat config and data (store .env, etc.)
+    Value: !Ref LibreChatBucket
+  DynamoDBTableName:
+    Description: Name of DynamoDB table for chat history (if used by the app)
+    Value: !Ref LibreChatTable
