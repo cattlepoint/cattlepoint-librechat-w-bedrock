@@ -53,8 +53,8 @@ Every commit to the default branch will redeploy your LibreChat stack.
 ### Tearing down
 
 ```bash
-aws cloudformation delete-stack --stack-name librechat-pipeline   # if used
 aws cloudformation delete-stack --stack-name librechat
+aws cloudformation delete-stack --stack-name librechat-pipeline   # if used
 ```
 
 All application data in S3 and DynamoDB is erased automatically by the built‑in cleanup Lambda.
