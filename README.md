@@ -1,4 +1,5 @@
 # DEMO ONLY - Requires immediate hardening to prevent anonymous internet users from using
+
 ### This project is vibe-coded; use at your own risk
 
 # cattlepoint‑librechat‑w‑bedrock
@@ -7,7 +8,7 @@ Deploy a demo of [LibreChat](https://github.com/danny-avila/LibreChat) instance 
 
 ## Key Features
 
-* ⚡ **Graviton Spot EC2** (`t4g.small`) keeps runtime cost <\$10/mo.
+* ⚡ **Graviton Spot EC2** (`t4g.small`) keeps runtime cost ≈ \$5/mo.
 * 🛡️ Traffic terminates at a regional **Application Load Balancer** and is fronted by **CloudFront** (TLS 1.2, HTTP/2).
 * 🔐 The instance role is granted **Amazon Bedrock Full Access** only; data is stored in a private **S3** bucket and an optional **DynamoDB** table (pay‑per‑request).
 * 🔄 **Custom Lambda resources** automatically generate and upload a minimal `.env` file and `librechat.yaml` on first deploy.
@@ -16,14 +17,14 @@ Deploy a demo of [LibreChat](https://github.com/danny-avila/LibreChat) instance 
 
 ## Prerequisites
 
-| Tool                | Minimum version            | Notes                                                                                            |
-| ------------------- | -------------------------- | ------------------------------------------------------------------------------------------------ |
-| AWS CLI             |  2.16                      | Configure with credentials that can create IAM, S3, CloudFront, EC2, and CodePipeline resources. |
-| Python              |  3.11                      | Only needed locally for linting.                                                                 |
-| Region              | us‑east‑1/‑2, us‑west‑1/‑2 | Amazon Bedrock Graviton support varies; pick one of the listed regions.                          |
-| GitHub <sup>✱</sup> | n/a                        | Required only when you use the pipeline template.                                                |
+| Tool     | Minimum version            | Notes                                                                                            |
+| -------- | -------------------------- | ------------------------------------------------------------------------------------------------ |
+| AWS CLI  |  2.16                      | Configure with credentials that can create IAM, S3, CloudFront, EC2, and CodePipeline resources. |
+| Python   |  3.11                      | Only needed locally for linting.                                                                 |
+| Region   | us‑east‑1/‑2, us‑west‑1/‑2 | Amazon Bedrock Graviton support varies; pick one of the listed regions.                          |
+| GitHub ✱ | n/a                        | Required only when you use the pipeline template.                                                |
 
-<sup>✱</sup> A [CodeStar Connections](https://docs.aws.amazon.com/dtconsole/latest/userguide/connections-create-github.html) ARN is needed so CodePipeline can pull from your repo.
+✱ A [CodeStar Connections](https://docs.aws.amazon.com/dtconsole/latest/userguide/connections-create-github.html) ARN is needed so CodePipeline can pull from your repo.
 
 ## Deployment
 
@@ -80,15 +81,20 @@ mypy .
 bandit -r .
 ```
 
-## Cost Estimate (us‑east‑1)
+## Cost Estimate (us-east-1)
 
-| Component                                       | Monthly USD |
-| ----------------------------------------------- | ----------- |
-| t4g.small Spot (100% utilisation)               | \~\$5.40    |
-| S3 (1 GB) + PUT/GET                             | <\$0.10     |
-| DynamoDB pay‑per‑request (≈1 K RCU/WCU per day) | <\$1        |
-| CloudFront (100 GB data transfer out)           | \~\$8.20    |
-| **Total**                                       | **≈ \$15**  |
+| Component                                                   | Monthly USD |
+| ----------------------------------------------------------- | ----------- |
+| t4g.small Spot (100% utilisation)                           | ≈ \$4.40    |
+| Application Load Balancer (730 h + 1 LCU)                   | ≈ \$22.30   |
+| S3 (1 GB) + PUT/GET                                         | < \$0.05    |
+| DynamoDB pay‑per‑request (≈1 K RCU/WCU per day)             | < \$0.05    |
+| CloudFront (100 GB data transfer out)                       | ≈ \$8.50    |
+| Bedrock: Nova Premier – 100× (1 k in / 1 k out) tokens      | ≈ \$1.50    |
+| Bedrock: Claude 3.5 Sonnet – 100× (1 k in / 1 k out) tokens | ≈ \$1.80    |
+| **Total**                                                   | **≈ \$39**  |
+
+*Estimates assume each query exchanges \~1,000 input and 1,000 output tokens.*
 
 ## Customisation
 
